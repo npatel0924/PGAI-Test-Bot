@@ -6,7 +6,19 @@ class ChatGPTService:
     """Service for ChatGPT conversation generation"""
     
     def __init__(self):
-        self.client = openai.OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        # Build an OpenAI client that supports both the new `OpenAI` class
+        # and the legacy module-level API (openai<1.0). Prefer `OpenAI` when
+        # available; otherwise set `openai.api_key` and use module functions.
+        api_key = os.getenv('OPENAI_API_KEY')
+        if hasattr(openai, 'OpenAI'):
+            try:
+                self.client = openai.OpenAI(api_key=api_key)
+            except TypeError:
+                openai.api_key = api_key
+                self.client = openai
+        else:
+            openai.api_key = api_key
+            self.client = openai
         self.model = "gpt-3.5-turbo"  # or "gpt-4" for better responses
         
     def generate_response(self,
@@ -25,11 +37,17 @@ class ChatGPTService:
         ]
         
         # Add conversation history (last 10 turns for context)
+        # Map local `speaker` labels to ChatGPT roles:
+        # - ai_agent -> 'user' (things the patient is responding to)
+        # - patient -> 'assistant' (previous patient replies)
         for turn in conversation_history[-10:]:
-            role = "assistant" if turn['speaker'] == 'patient' else "user"
+            if turn.get('speaker') == 'ai_agent':
+                role = 'user'
+            else:
+                role = 'assistant'
             messages.append({
                 "role": role,
-                "content": turn['text']
+                "content": turn.get('text', '')
             })
         
         # Add instruction for next response
@@ -39,7 +57,7 @@ class ChatGPTService:
         })
         
         try:
-            # Call ChatGPT API [citation:10]
+            # Preferred client call (new-style client)
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
@@ -48,20 +66,39 @@ class ChatGPTService:
                 presence_penalty=0.6,
                 frequency_penalty=0.3
             )
-            
+            text = getattr(response.choices[0].message, 'content', None) or getattr(response.choices[0], 'message', {}).get('content', '')
+            tokens_used = getattr(response, 'usage', {}).get('total_tokens', 0)
             return {
-                "text": response.choices[0].message.content,
-                "tokens_used": response.usage.total_tokens,
+                "text": text,
+                "tokens_used": tokens_used,
                 "model": self.model
             }
-            
-        except Exception as e:
-            print(f"ChatGPT error: {e}")
-            return {
-                "text": "I'm sorry, could you repeat that?",
-                "tokens_used": 0,
-                "model": self.model
-            }
+
+        except Exception as primary_exc:
+            # Fallbacks for alternate openai package shapes
+            print(f"ChatGPT primary call failed: {primary_exc}")
+            try:
+                # Legacy / module-level ChatCompletion interface
+                alt_resp = openai.ChatCompletion.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=0.7,
+                    max_tokens=150
+                )
+                text = alt_resp['choices'][0]['message']['content'] if 'choices' in alt_resp else ''
+                tokens = alt_resp.get('usage', {}).get('total_tokens', 0)
+                return {
+                    'text': text,
+                    'tokens_used': tokens,
+                    'model': self.model
+                }
+            except Exception as fallback_exc:
+                print(f"ChatGPT fallback call failed: {fallback_exc}")
+                return {
+                    "text": "I'm sorry, could you repeat that?",
+                    "tokens_used": 0,
+                    "model": self.model
+                }
     
     def _build_system_prompt(self, base_prompt: str, persona: Dict) -> str:
         """Build complete system prompt with persona details"""
